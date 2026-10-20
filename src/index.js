@@ -30,7 +30,7 @@ const handle = action => async args => {
 };
 
 server.registerTool('minecraft_status', {
-  description: 'Check whether the local Bedrock world is connected. Returns the exact /connect command. No world changes.',
+  description: 'Check the Bedrock connection, session readiness, encryption, unresolved requests and bounded response diagnostics. Returns the exact /connect command. No world changes.',
   inputSchema: z.object({}),
   annotations: { readOnlyHint: true, openWorldHint: false },
 }, () => reply(bridge.status()));

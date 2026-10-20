@@ -1,12 +1,32 @@
 import { randomUUID } from 'node:crypto';
+import { Buffer } from 'node:buffer';
 import WebSocket, { WebSocketServer } from 'ws';
 import { normalizeCommand } from './commands.js';
+import { createEncryptionOffer } from './encryption.js';
+
+const ENCRYPTION_PROTOCOL = 'com.microsoft.minecraft.wsencrypt';
+const visibleCommand = command => command.startsWith('enableencryption ') ? 'enableencryption [key exchange]' : command;
 
 function commandError(message, code, resultUnknown = false) {
   return Object.assign(new Error(message), { code, resultUnknown });
 }
 
-/** Local, unencrypted WebSocket transport for the Bedrock /connect command. */
+function sessionDiagnostics() {
+  return {
+    receivedFrames: 0,
+    invalidJsonFrames: 0,
+    binaryFrames: 0,
+    sentCommands: 0,
+    lastReceivedAt: null,
+    recentFrames: [],
+  };
+}
+
+function shortString(value, limit = 100) {
+  return typeof value === 'string' ? value.slice(0, limit) : undefined;
+}
+
+/** Local WebSocket transport, with Bedrock's optional encrypted subprotocol. */
 export class BedrockBridge {
   constructor({ host = '127.0.0.1', port = 19131, commandTimeoutMs = 10_000 } = {}) {
     if (!['127.0.0.1', '::1', 'localhost'].includes(host)) {
@@ -25,10 +45,16 @@ export class BedrockBridge {
     this._socket = null;
     this._connectedAt = null;
     this._lastError = null;
+    this._lastDisconnect = null;
+    this._diagnostics = sessionDiagnostics();
     this._queue = [];
     this._pending = null;
     this._starting = null;
     this._closing = null;
+    this._cipher = null;
+    this._encryptedInbound = false;
+    this._ready = false;
+    this._initialization = 'disconnected';
   }
 
   async start() {
@@ -36,18 +62,35 @@ export class BedrockBridge {
     if (this._starting) return this._starting;
     if (this._server?.address()) return this._server.address();
 
+    this._starting = (async () => {
+      try { return await this._listen(this.port); }
+      catch (error) {
+        // Codex can start independent MCP clients for concurrent sessions.
+        // Keep this session usable without displacing another connected world.
+        if (error.code === 'EADDRINUSE' && this.port !== 0) return this._listen(0);
+        throw error;
+      }
+    })();
+    try { return await this._starting; }
+    finally { this._starting = null; }
+  }
+
+  _listen(port) {
     const server = new WebSocketServer({
       host: this.host,
-      port: this.port,
+      port,
       maxPayload: 1024 * 1024,
       perMessageDeflate: false,
+      // Accept historical encrypted text frames as well as modern binary frames.
+      skipUTF8Validation: true,
+      handleProtocols: protocols => protocols.has(ENCRYPTION_PROTOCOL) ? ENCRYPTION_PROTOCOL : false,
     });
     this._server = server;
     server.on('connection', (socket) => this._accept(socket));
     // Retain an error listener after startup, so network errors never crash stdio MCP.
     server.on('error', (error) => { this._lastError = error.message; });
 
-    this._starting = new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const onError = (error) => {
         server.off('listening', onListening);
         if (this._server === server) this._server = null;
@@ -55,16 +98,12 @@ export class BedrockBridge {
       };
       const onListening = () => {
         server.off('error', onError);
+        this._lastError = null;
         resolve(server.address());
       };
       server.once('error', onError);
       server.once('listening', onListening);
     });
-    try {
-      return await this._starting;
-    } finally {
-      this._starting = null;
-    }
   }
 
   status() {
@@ -74,18 +113,32 @@ export class BedrockBridge {
     return {
       listening: Boolean(address),
       connected: this._socket?.readyState === WebSocket.OPEN,
+      ready: this._ready,
+      encryption: this._cipher ? 'enabled' : 'disabled',
+      initialization: this._initialization,
+      websocketProtocol: this._socket?.protocol ?? null,
       host: this.host,
       port,
       connectCommand: `/connect ${endpointHost}:${port}`,
       connectedAt: this._connectedAt,
       queuedCommands: this._queue.length,
-      inFlight: this._pending ? {
+      inFlight: this._pending && !this._pending.awaitingLateResponse ? {
         requestId: this._pending.requestId,
-        command: this._pending.command,
+        command: visibleCommand(this._pending.command),
+      } : null,
+      awaitingLateResponse: this._pending?.awaitingLateResponse ? {
+        requestId: this._pending.requestId,
+        command: visibleCommand(this._pending.command),
+        timedOutAt: this._pending.timedOutAt ?? null,
       } : null,
       lastError: this._lastError,
-      requireEncryptedWebsockets: false,
-      encryptionNote: 'Set Minecraft Settings > General > Require Encrypted Websockets to OFF. This bridge uses local, unencrypted WebSockets.',
+      lastDisconnect: this._lastDisconnect ? { ...this._lastDisconnect } : null,
+      diagnostics: {
+        ...this._diagnostics,
+        recentFrames: this._diagnostics.recentFrames.map((frame) => ({ ...frame })),
+      },
+      supportsEncryptedWebsockets: true,
+      encryptionNote: 'Bedrock encryption is negotiated when the client requests com.microsoft.minecraft.wsencrypt. Listener is loopback only.',
     };
   }
 
@@ -94,8 +147,18 @@ export class BedrockBridge {
     if (this._socket?.readyState !== WebSocket.OPEN || this._closing) {
       throw commandError(`Minecraft is not connected. In the game, run ${this.status().connectCommand}`, 'NOT_CONNECTED');
     }
+    if (this._pending?.awaitingLateResponse) {
+      throw commandError('The previous command result is still unknown. Waiting for its matching response; this command was not sent. Do not retry the previous command automatically.', 'COMMAND_RESULT_PENDING');
+    }
+    if (!this._ready) {
+      throw commandError(`Minecraft session initialization is ${this._initialization}. This command was not sent. Check minecraft_status.`, 'SESSION_NOT_READY');
+    }
+    return this._enqueue(commandLine);
+  }
+
+  _enqueue(commandLine, onResponse, frame) {
     return new Promise((resolve, reject) => {
-      this._queue.push({ command: commandLine, resolve, reject });
+      this._queue.push({ command: commandLine, resolve, reject, onResponse, frame });
       this._drain();
     });
   }
@@ -115,40 +178,126 @@ export class BedrockBridge {
     this._socket = socket;
     this._connectedAt = new Date().toISOString();
     this._lastError = null;
-    socket.on('message', (data) => this._receive(socket, data));
-    socket.on('close', () => this._disconnect(socket, 'The Minecraft connection closed.'));
+    this._lastDisconnect = null;
+    this._diagnostics = sessionDiagnostics();
+    this._cipher = null;
+    this._encryptedInbound = false;
+    this._ready = socket.protocol !== ENCRYPTION_PROTOCOL;
+    this._initialization = this._ready ? 'ready' : 'getting_player_name';
+    socket.on('message', (data, isBinary) => this._receive(socket, data, isBinary));
+    socket.on('close', (code, reason) => {
+      if (this._socket !== socket) return;
+      this._lastDisconnect = {
+        at: new Date().toISOString(),
+        code,
+        reason: reason.toString().slice(0, 300),
+      };
+      this._disconnect(socket, 'The Minecraft connection closed.');
+    });
+    if (!this._ready) void this._initializeEncryption(socket);
   }
 
-  _receive(socket, data) {
+  _initializeEncryption(socket) {
+    const fail = error => {
+      if (this._socket !== socket) return;
+      this._initialization = 'failed';
+      this._ready = false;
+      this._lastError = `Session initialization failed: ${error.message}`;
+    };
+    // Response callbacks also run for late replies, so a paused game can resume
+    // this sequence after the original promise has already timed out.
+    void this._enqueue('getlocalplayername', name => {
+      if (this._socket !== socket) return;
+      if (name.messagePurpose === 'error' || name.statusCode < 0) {
+        fail(new Error('Minecraft rejected getlocalplayername during initialization.'));
+        return;
+      }
+      const offer = createEncryptionOffer();
+      this._initialization = 'negotiating_encryption';
+      void this._enqueue('ws:encrypt [key exchange]', result => {
+        if (result.messagePurpose === 'error' || result.statusCode < 0) throw new Error('Minecraft rejected the encryption handshake.');
+        // Install synchronously after ws:encrypt. This response intentionally
+        // lacks statusCode; only ordinary command replies require it.
+        this._cipher = offer.complete(result.body.publicKey);
+        this._ready = true;
+        this._initialization = 'ready';
+      }, { purpose: 'ws:encrypt', body: offer.requestBody }).catch(fail);
+    }).catch(fail);
+  }
+
+  _receive(socket, data, isBinary = false) {
     if (this._socket !== socket) return;
+    const payload = Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data);
+    const receivedAt = new Date().toISOString();
+    const diagnostics = this._diagnostics;
+    diagnostics.receivedFrames += 1;
+    diagnostics.lastReceivedAt = receivedAt;
+    if (isBinary) diagnostics.binaryFrames += 1;
+    const summary = { receivedAt, binary: Boolean(isBinary), bytes: payload.byteLength };
+    diagnostics.recentFrames.push(summary);
+    if (diagnostics.recentFrames.length > 8) diagnostics.recentFrames.shift();
     let packet;
     try {
-      packet = JSON.parse(data.toString());
+      // A plaintext reply can trail the key-exchange notification. Do not
+      // consume the continuous decipher until the first actual ciphertext.
+      // See mcpews base.ts. Parse full JSON rather than guessing from one byte.
+      if (this._cipher && !this._encryptedInbound) {
+        try { packet = JSON.parse(payload.toString()); } catch { /* ciphertext */ }
+      }
+      if (!packet) {
+        const plaintext = this._cipher ? this._cipher.decrypt(payload) : payload;
+        if (this._cipher) this._encryptedInbound = true;
+        packet = JSON.parse(plaintext.toString());
+      }
     } catch {
+      diagnostics.invalidJsonFrames += 1;
+      summary.invalidJson = true;
       this._lastError = 'Ignored an invalid JSON message from Minecraft.';
       return;
     }
+    // Only allow selected metadata into diagnostics. Never retain command or chat
+    // payloads; initial and uncorrelated errors are still useful for debugging.
+    summary.messagePurpose = shortString(packet?.header?.messagePurpose);
+    summary.requestId = shortString(packet?.header?.requestId);
+    if (Number.isSafeInteger(packet?.body?.statusCode)) summary.statusCode = packet.body.statusCode;
+    summary.statusMessage = shortString(packet?.body?.statusMessage, 300);
+    summary.eventName = shortString(packet?.header?.eventName ?? packet?.body?.eventName);
     const pending = this._pending;
     if (!pending || packet?.header?.requestId !== pending.requestId) return;
     const purpose = packet.header.messagePurpose;
-    if (purpose !== 'commandResponse' && purpose !== 'error') return;
+    const expectedPurpose = pending.frame?.purpose ?? 'commandResponse';
+    if (purpose !== expectedPurpose && purpose !== 'error') return;
+    const isEncryptionReply = expectedPurpose === 'ws:encrypt' && purpose === 'ws:encrypt';
     if (!packet.body || typeof packet.body !== 'object' || Array.isArray(packet.body)
-      || !Number.isSafeInteger(packet.body.statusCode)) {
+      || (!isEncryptionReply && !Number.isSafeInteger(packet.body.statusCode))) {
       this._lastError = 'Minecraft returned an invalid command response without a numeric statusCode.';
-      this._disconnect(socket, this._lastError, 'INVALID_RESPONSE');
-      socket.terminate();
+      this._quarantinePending(this._lastError, 'INVALID_RESPONSE');
       return;
     }
 
-    clearTimeout(pending.timer);
-    this._pending = null;
-    pending.resolve({
+    const result = {
       requestId: pending.requestId,
       command: pending.command,
       messagePurpose: purpose,
-      statusCode: packet.body.statusCode,
+      // ws:encrypt is a key-exchange response, not a command result. Its
+      // publicKey is validated synchronously by the encryption callback.
+      statusCode: isEncryptionReply ? 0 : packet.body.statusCode,
       body: packet.body,
-    });
+    };
+    try {
+      pending.onResponse?.(result);
+    } catch (error) {
+      this._lastError = `Invalid encryption response: ${error.message}`;
+      this._quarantinePending(this._lastError, 'INVALID_ENCRYPTION_RESPONSE');
+      return;
+    }
+    clearTimeout(pending.timer);
+    this._pending = null;
+    if (pending.awaitingLateResponse) this._lastError = null;
+    if (!pending.settled) {
+      pending.settled = true;
+      pending.resolve(result);
+    }
     this._drain();
   }
 
@@ -161,20 +310,20 @@ export class BedrockBridge {
     pending.timer = setTimeout(() => {
       if (this._pending !== pending) return;
       this._lastError = `Timed out after ${this.commandTimeoutMs} ms waiting for Minecraft.`;
-      // The game may still execute this request. End the session to avoid sending
-      // later commands after an unknown result, and never replay queued commands.
-      this._disconnect(socket, this._lastError, 'COMMAND_TIMEOUT');
-      socket.terminate();
+      pending.timedOutAt = new Date().toISOString();
+      // Retain the socket and request ID: a late response may establish the
+      // result. No subsequent command may pass this unresolved request.
+      this._quarantinePending(this._lastError, 'COMMAND_TIMEOUT');
     }, this.commandTimeoutMs);
 
     const packet = {
       header: {
         version: 1,
         requestId: pending.requestId,
-        messageType: 'commandRequest',
-        messagePurpose: 'commandRequest',
+        ...(!pending.frame ? { messageType: 'commandRequest' } : {}),
+        messagePurpose: pending.frame?.purpose ?? 'commandRequest',
       },
-      body: {
+      body: pending.frame?.body ?? {
         commandLine: pending.command,
         origin: { type: 'player' },
       },
@@ -182,7 +331,10 @@ export class BedrockBridge {
     // body.version selects Minecraft command syntax, not the transport protocol.
     // Omit it so the game uses its current syntax (bedrock-ws Client.run).
     try {
-      socket.send(JSON.stringify(packet), (error) => {
+      this._diagnostics.sentCommands += 1;
+      const plaintext = Buffer.from(JSON.stringify(packet));
+      const wire = this._cipher ? this._cipher.encrypt(plaintext) : plaintext;
+      socket.send(wire, { binary: Boolean(this._cipher) }, (error) => {
         if (!error || this._socket !== socket) return;
         this._lastError = error.message;
         this._disconnect(socket, 'Sending the Minecraft command failed.');
@@ -195,10 +347,25 @@ export class BedrockBridge {
     }
   }
 
+  _quarantinePending(reason, code) {
+    const pending = this._pending;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pending.awaitingLateResponse = true;
+    if (!pending.settled) {
+      pending.settled = true;
+      pending.reject(commandError(`${reason} The command result is unknown; it may have executed. Do not retry automatically. The connection remains open while waiting for its response.`, code, true));
+    }
+    this._rejectQueued(reason, code);
+  }
+
   _disconnect(socket, reason, code = 'CONNECTION_CLOSED') {
     if (this._socket !== socket) return;
     this._socket = null;
     this._connectedAt = null;
+    this._ready = false;
+    this._initialization = 'disconnected';
+    this._cipher = null;
     this._rejectCommands(reason, code);
   }
 
@@ -207,8 +374,15 @@ export class BedrockBridge {
     this._pending = null;
     if (pending) {
       clearTimeout(pending.timer);
-      pending.reject(commandError(`${reason} The command result is unknown; it may have executed. Do not retry automatically.`, code, true));
+      if (!pending.settled) {
+        pending.settled = true;
+        pending.reject(commandError(`${reason} The command result is unknown; it may have executed. Do not retry automatically.`, code, true));
+      }
     }
+    this._rejectQueued(reason, code);
+  }
+
+  _rejectQueued(reason, code) {
     for (const queued of this._queue.splice(0)) {
       queued.reject(commandError(`${reason} This queued command was not sent.`, code));
     }
@@ -219,6 +393,9 @@ export class BedrockBridge {
     this._rejectCommands('The Bedrock bridge is closing.', 'BRIDGE_CLOSED');
     this._socket = null;
     this._connectedAt = null;
+    this._ready = false;
+    this._initialization = 'disconnected';
+    this._cipher = null;
     const server = this._server;
     this._server = null;
     if (!server) return;

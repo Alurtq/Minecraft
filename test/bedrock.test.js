@@ -18,6 +18,14 @@ function receive(game) {
   return once(game, 'message').then(([data]) => JSON.parse(data.toString()));
 }
 
+async function waitUntil(condition) {
+  const deadline = Date.now() + 1000;
+  while (!condition() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(condition(), 'condition was not reached');
+}
+
 function respond(game, request, body = { statusCode: 0, statusMessage: 'OK' }, messagePurpose = 'commandResponse') {
   game.send(JSON.stringify({
     header: { version: 1, requestId: request.header.requestId, messagePurpose },
@@ -28,7 +36,9 @@ function respond(game, request, body = { statusCode: 0, statusMessage: 'OK' }, m
 test('uses slashless commands, UUID correlation and current command syntax', async (t) => {
   const { bridge, game } = await setup(t);
   assert.equal(bridge.status().connected, true);
-  assert.equal(bridge.status().requireEncryptedWebsockets, false);
+  assert.equal(bridge.status().supportsEncryptedWebsockets, true);
+  assert.equal(bridge.status().encryption, 'disabled');
+  assert.equal(bridge.status().ready, true);
   assert.match(bridge.status().connectCommand, /^\/connect 127\.0\.0\.1:\d+$/);
   const requestReceived = receive(game);
   const result = bridge.command('/setblock 1 70 2 stone');
@@ -72,21 +82,28 @@ test('preserves negative status codes and protocol error responses', async (t) =
   }
 });
 
-test('invalid matching responses never report success or send queued commands', async (t) => {
+test('invalid matching responses quarantine commands without closing the game connection', async (t) => {
   for (const body of [{}, { statusCode: '0' }, { statusCode: null }]) {
     const { bridge, game } = await setup(t);
     let sent = 0;
     game.on('message', () => { sent += 1; });
     const next = receive(game);
     const results = Promise.allSettled([bridge.command('say first'), bridge.command('say next')]);
-    respond(game, await next, body);
+    const request = await next;
+    respond(game, request, body);
     const [active, queued] = await results;
     assert.equal(active.status, 'rejected');
     assert.equal(active.reason.code, 'INVALID_RESPONSE');
     assert.equal(active.reason.resultUnknown, true);
     assert.equal(queued.reason.resultUnknown, false);
     assert.equal(sent, 1);
-    assert.equal(bridge.status().connected, false);
+    assert.equal(bridge.status().connected, true);
+    assert.equal(game.readyState, WebSocket.OPEN);
+    assert.equal(bridge.status().awaitingLateResponse.requestId, request.header.requestId);
+    await assert.rejects(bridge.command('say blocked'), { code: 'COMMAND_RESULT_PENDING', resultUnknown: false });
+    respond(game, request);
+    await waitUntil(() => bridge.status().awaitingLateResponse === null);
+    assert.equal(sent, 1);
   }
 });
 
@@ -134,28 +151,125 @@ test('disconnect marks in-flight result unknown and rejects unsent queue', async
   await assert.rejects(bridge.command('say hello'), { code: 'NOT_CONNECTED' });
 });
 
-test('timeout ends the session without sending or replaying queued commands', async (t) => {
+test('timeout retains the connection, blocks new commands and never replays the queue', async (t) => {
   const { bridge, game } = await setup(t, { commandTimeoutMs: 40 });
   let sent = 0;
+  let closed = false;
   game.on('message', () => { sent += 1; });
+  game.on('close', () => { closed = true; });
+  const next = receive(game);
   const first = bridge.command('setblock 0 70 0 stone');
   const second = bridge.command('setblock 1 70 0 stone');
-  const [active, queued] = await Promise.allSettled([first, second]);
+  const outcomes = Promise.allSettled([first, second]);
+  const request = await next;
+  const [active, queued] = await outcomes;
   assert.equal(active.reason.code, 'COMMAND_TIMEOUT');
   assert.equal(active.reason.resultUnknown, true);
   assert.equal(queued.reason.resultUnknown, false);
   assert.equal(sent, 1);
-  assert.equal(bridge.status().connected, false);
+  assert.equal(bridge.status().connected, true);
+  assert.equal(game.readyState, WebSocket.OPEN);
+  assert.equal(closed, false);
   assert.equal(bridge.status().queuedCommands, 0);
+  assert.equal(bridge.status().inFlight, null);
+  assert.deepEqual(bridge.status().awaitingLateResponse, {
+    requestId: request.header.requestId,
+    command: 'setblock 0 70 0 stone',
+    timedOutAt: bridge.status().awaitingLateResponse.timedOutAt,
+  });
+  assert.ok(bridge.status().awaitingLateResponse.timedOutAt);
+  await assert.rejects(bridge.command('say blocked'), { code: 'COMMAND_RESULT_PENDING', resultUnknown: false });
+  game.send(JSON.stringify({ header: { requestId: 'unrelated', messagePurpose: 'commandResponse' }, body: { statusCode: 0 } }));
+  await waitUntil(() => bridge.status().diagnostics.receivedFrames === 1);
+  assert.equal(bridge.status().awaitingLateResponse.requestId, request.header.requestId);
+  respond(game, request);
+  await waitUntil(() => bridge.status().awaitingLateResponse === null);
+  assert.equal(sent, 1);
+  assert.equal(bridge.status().lastError, null);
+  const nextAfterLateResponse = receive(game);
+  const result = bridge.command('say late response received');
+  const newRequest = await nextAfterLateResponse;
+  assert.equal(newRequest.body.commandLine, 'say late response received');
+  assert.notEqual(newRequest.header.requestId, request.header.requestId);
+  respond(game, newRequest);
+  await result;
+  assert.equal(sent, 2);
+});
+
+test('quarantined requests clear safely on disconnect and close', async (t) => {
+  for (const action of ['disconnect', 'close']) {
+    const { bridge, game } = await setup(t, { commandTimeoutMs: 30 });
+    const result = bridge.command('say timeout');
+    await assert.rejects(result, { code: 'COMMAND_TIMEOUT', resultUnknown: true });
+    assert.ok(bridge.status().awaitingLateResponse);
+    if (action === 'close') await bridge.close();
+    else {
+      game.close(1000, 'Manual disconnect');
+      await waitUntil(() => !bridge.status().connected);
+      assert.equal(bridge.status().lastDisconnect.code, 1000);
+      assert.equal(bridge.status().lastDisconnect.reason, 'Manual disconnect');
+    }
+    assert.equal(bridge.status().awaitingLateResponse, null);
+    assert.equal(bridge.status().inFlight, null);
+  }
+});
+
+test('bounded diagnostics retain initial errors and metadata without command or chat payloads', async (t) => {
+  const { bridge, game } = await setup(t);
+  assert.equal(bridge.status().websocketProtocol, '');
+  const statusMessage = 'x'.repeat(450);
+  const errorPacket = {
+    header: { messagePurpose: 'error', requestId: 'initial-uncorrelated-error' },
+    body: { statusCode: -42, statusMessage, commandLine: 'private command', Message: 'private chat' },
+  };
+  const json = JSON.stringify(errorPacket);
+  game.send(json);
+  game.send(Buffer.from('{not JSON'), { binary: true });
+  await waitUntil(() => bridge.status().diagnostics.receivedFrames === 2);
+  let diagnostics = bridge.status().diagnostics;
+  assert.equal(diagnostics.sentCommands, 0);
+  assert.equal(diagnostics.invalidJsonFrames, 1);
+  assert.equal(diagnostics.binaryFrames, 1);
+  assert.ok(diagnostics.lastReceivedAt);
+  assert.deepEqual(diagnostics.recentFrames[0], {
+    receivedAt: diagnostics.recentFrames[0].receivedAt,
+    binary: false,
+    bytes: Buffer.byteLength(json),
+    messagePurpose: 'error',
+    requestId: 'initial-uncorrelated-error',
+    statusCode: -42,
+    statusMessage: 'x'.repeat(300),
+    eventName: undefined,
+  });
+  assert.equal(diagnostics.recentFrames[1].invalidJson, true);
+  assert.equal(diagnostics.recentFrames[1].binary, true);
+  assert.doesNotMatch(JSON.stringify(diagnostics), /private command|private chat/);
+  // Mutating returned metadata cannot alter the bridge's retained evidence.
+  diagnostics.recentFrames[0].statusCode = 123;
+  assert.equal(bridge.status().diagnostics.recentFrames[0].statusCode, -42);
+  for (let index = 0; index < 10; index += 1) {
+    game.send(JSON.stringify({ header: { messagePurpose: 'event', eventName: 'PlayerMessage', requestId: `event-${index}` }, body: { Message: 'private chat' } }));
+  }
+  await waitUntil(() => bridge.status().diagnostics.receivedFrames === 12);
+  diagnostics = bridge.status().diagnostics;
+  assert.equal(diagnostics.recentFrames.length, 8);
+  assert.equal(diagnostics.recentFrames[0].requestId, 'event-2');
+  assert.equal(diagnostics.recentFrames[7].eventName, 'PlayerMessage');
+  assert.doesNotMatch(JSON.stringify(diagnostics), /private chat/);
+
+  game.close(1000, 'New session');
+  await waitUntil(() => !bridge.status().connected);
   const reconnected = new WebSocket(`ws://127.0.0.1:${bridge.status().port}`);
   reconnected.on('error', () => {});
   await once(reconnected, 'open');
-  const next = receive(reconnected);
-  const result = bridge.command('say reconnected');
-  const request = await next;
-  assert.equal(request.body.commandLine, 'say reconnected');
-  respond(reconnected, request);
-  await result;
+  assert.deepEqual(bridge.status().diagnostics, {
+    receivedFrames: 0,
+    invalidJsonFrames: 0,
+    binaryFrames: 0,
+    sentCommands: 0,
+    lastReceivedAt: null,
+    recentFrames: [],
+  });
 });
 
 test('rejects a second game client without replacing the first', async (t) => {
@@ -192,4 +306,24 @@ test('accepts only loopback listeners and rejects commands before connection', a
   const bridge = new BedrockBridge({ port: 0 });
   await assert.rejects(bridge.command('say hello'), { code: 'NOT_CONNECTED', resultUnknown: false });
   await bridge.close();
+});
+
+test('concurrent sessions select distinct ports without disrupting the first listener', async t => {
+  const first = new BedrockBridge({ port: 0 });
+  t.after(() => first.close());
+  const address = await first.start();
+  const second = new BedrockBridge({ port: address.port });
+  t.after(() => second.close());
+  const other = await second.start();
+  assert.notEqual(other.port, address.port);
+  assert.equal(first.status().port, address.port);
+  assert.equal(second.status().port, other.port);
+  assert.equal(second.status().lastError, null);
+  assert.equal(second.status().connectCommand, `/connect 127.0.0.1:${other.port}`);
+  const game = new WebSocket(`ws://127.0.0.1:${other.port}`);
+  await once(game, 'open');
+  const next = receive(game);
+  const command = second.command('getlocalplayername');
+  respond(game, await next);
+  assert.equal((await command).statusCode, 0);
 });
