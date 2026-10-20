@@ -1,0 +1,20 @@
+{
+  "name": "minecraft-bedrock-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local MCP tools for building in a Minecraft Bedrock Windows world over WebSocket",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "ws": "^8.18.3",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1"
+  }
+}
