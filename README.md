@@ -38,7 +38,7 @@
 ```toml
 [mcp_servers.minecraft-bedrock]
 command = 'C:\Program Files\nodejs\node.exe'
-args = ['C:\Users\coolb\GitHub\Abap\minecraft-bedrock-mcp\src\index.js']
+args = ['C:\Users\coolb\GitHub\Minecraft\src\index.js']
 startup_timeout_sec = 15
 tool_timeout_sec = 120
 ```
@@ -46,7 +46,7 @@ tool_timeout_sec = 120
 Либо добавить через CLI:
 
 ```powershell
-codex mcp add minecraft-bedrock -- "C:\Program Files\nodejs\node.exe" "C:\Users\coolb\GitHub\Abap\minecraft-bedrock-mcp\src\index.js"
+codex mcp add minecraft-bedrock -- "C:\Program Files\nodejs\node.exe" "C:\Users\coolb\GitHub\Minecraft\src\index.js"
 ```
 
 После изменения конфигурации перезапустить MCP через интерфейс приложения или
