@@ -45,23 +45,28 @@ server.registerTool('minecraft_command', {
 }));
 
 server.registerTool('minecraft_batch', {
-  description: 'Run up to 128 Bedrock commands in order, waiting for each game response. Stops on the first failure by default. Changes already made remain; there is no rollback. Timeout/disconnection always stops the batch with unknown outcome for the current command.',
-  inputSchema: z.object({ commands: z.array(command).min(1).max(128), stopOnError: z.boolean().default(true) }),
+  description: 'Run up to 128 Bedrock commands as one isolated job. By default, wait for each response and stop at the first failure. For independent commands, set concurrency to 4 or 8 and stopOnError to false to overlap response waits. Concurrent commands must not depend on execution order, player movement or one another. There is no rollback; already-sent commands may execute after a failure. Timeout/disconnection stops dispatch, reports unknown outcomes and never retries. Use responseDetail="summary" to return counts and failures without repeating successful results.',
+  inputSchema: z.object({
+    commands: z.array(command).min(1).max(128),
+    stopOnError: z.boolean().default(true),
+    concurrency: z.int().min(1).max(16).default(1),
+    responseDetail: z.enum(['full', 'summary']).default('full'),
+  }),
   annotations: writeAnnotations,
-}, handle(async ({ commands, stopOnError }) => {
-  // Validate the entire list before changing the world.
-  const normalized = commands.map(normalizeCommand);
-  const results = [];
-  for (const current of normalized) {
-    try {
-      const result = await bridge.command(current);
-      results.push(result);
-      if (stopOnError && failed(result)) break;
-    } catch (error) {
-      return reply({ results, interruptedCommand: current, error: error.message, code: error.code, resultUnknown: error.resultUnknown, requested: commands.length, completed: results.length }, true);
-    }
+}, handle(async ({ commands, stopOnError, concurrency, responseDetail }) => {
+  const batch = await bridge.batch(commands, { stopOnError, concurrency });
+  const hasError = Boolean(batch.error) || batch.results.some(failed);
+  if (responseDetail === 'summary') {
+    const { results, ...summary } = batch;
+    return reply({
+      ...summary,
+      succeeded: results.filter(result => !failed(result)).length,
+      failed: results.filter(failed).length,
+      unknown: (batch.failures ?? []).filter(failure => failure.resultUnknown).length,
+      commandFailures: results.filter(failed),
+    }, hasError);
   }
-  return reply({ results, requested: commands.length, completed: results.length }, results.some(failed));
+  return reply(batch, hasError);
 }));
 
 server.registerTool('minecraft_set_block', {

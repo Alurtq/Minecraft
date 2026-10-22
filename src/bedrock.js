@@ -28,7 +28,7 @@ function shortString(value, limit = 100) {
 
 /** Local WebSocket transport, with Bedrock's optional encrypted subprotocol. */
 export class BedrockBridge {
-  constructor({ host = '127.0.0.1', port = 19131, commandTimeoutMs = 10_000 } = {}) {
+  constructor({ host = '127.0.0.1', port = 19131, commandTimeoutMs = 10_000, maxQueuedCommands = 1024 } = {}) {
     if (!['127.0.0.1', '::1', 'localhost'].includes(host)) {
       throw new Error('The Bedrock bridge must bind to a loopback host.');
     }
@@ -38,9 +38,13 @@ export class BedrockBridge {
     if (!Number.isFinite(commandTimeoutMs) || commandTimeoutMs <= 0) {
       throw new Error('commandTimeoutMs must be positive.');
     }
+    if (!Number.isInteger(maxQueuedCommands) || maxQueuedCommands < 1) {
+      throw new Error('maxQueuedCommands must be a positive integer.');
+    }
     this.host = host;
     this.port = port;
     this.commandTimeoutMs = commandTimeoutMs;
+    this.maxQueuedCommands = maxQueuedCommands;
     this._server = null;
     this._socket = null;
     this._connectedAt = null;
@@ -48,7 +52,8 @@ export class BedrockBridge {
     this._lastDisconnect = null;
     this._diagnostics = sessionDiagnostics();
     this._queue = [];
-    this._pending = null;
+    this._pending = new Map();
+    this._activeJob = null;
     this._starting = null;
     this._closing = null;
     this._cipher = null;
@@ -110,6 +115,11 @@ export class BedrockBridge {
     const address = this._server?.address();
     const port = address && typeof address === 'object' ? address.port : this.port;
     const endpointHost = this.host.includes(':') ? `[${this.host}]` : this.host;
+    const outstanding = [...this._pending.values()];
+    const active = outstanding.filter(entry => !entry.awaitingLateResponse);
+    const late = outstanding.filter(entry => entry.awaitingLateResponse);
+    const pending = active[0];
+    const awaiting = late[0];
     return {
       listening: Boolean(address),
       connected: this._socket?.readyState === WebSocket.OPEN,
@@ -122,14 +132,19 @@ export class BedrockBridge {
       connectCommand: `/connect ${endpointHost}:${port}`,
       connectedAt: this._connectedAt,
       queuedCommands: this._queue.length,
-      inFlight: this._pending && !this._pending.awaitingLateResponse ? {
-        requestId: this._pending.requestId,
-        command: visibleCommand(this._pending.command),
+      maxQueuedCommands: this.maxQueuedCommands,
+      inFlightCount: active.length,
+      outstandingCommands: outstanding.length,
+      awaitingLateResponseCount: late.length,
+      batchConcurrency: this._activeJob?.concurrency ?? 1,
+      inFlight: pending ? {
+        requestId: pending.requestId,
+        command: visibleCommand(pending.command),
       } : null,
-      awaitingLateResponse: this._pending?.awaitingLateResponse ? {
-        requestId: this._pending.requestId,
-        command: visibleCommand(this._pending.command),
-        timedOutAt: this._pending.timedOutAt ?? null,
+      awaitingLateResponse: awaiting ? {
+        requestId: awaiting.requestId,
+        command: visibleCommand(awaiting.command),
+        timedOutAt: awaiting.timedOutAt ?? null,
       } : null,
       lastError: this._lastError,
       lastDisconnect: this._lastDisconnect ? { ...this._lastDisconnect } : null,
@@ -144,22 +159,85 @@ export class BedrockBridge {
 
   async command(command) {
     const commandLine = normalizeCommand(command);
+    this._assertReady();
+    return this._enqueue(commandLine);
+  }
+
+  async batch(commands, { concurrency = 1, stopOnError = true } = {}) {
+    if (!Array.isArray(commands) || commands.length < 1 || commands.length > 128) {
+      throw new RangeError('A batch must contain between 1 and 128 commands.');
+    }
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) {
+      throw new RangeError('concurrency must be an integer between 1 and 16.');
+    }
+    if (typeof stopOnError !== 'boolean') throw new TypeError('stopOnError must be a boolean.');
+    if (concurrency > 1 && stopOnError) {
+      throw new Error('Pipelined batches require stopOnError=false: commands already sent cannot be stopped. Use only independent commands.');
+    }
+    // Normalize every entry and reserve queue space before any world change.
+    const normalized = commands.map(normalizeCommand);
+    this._assertReady();
+    return this._enqueueJob(normalized, { concurrency, stopOnError, batch: true });
+  }
+
+  _assertReady() {
     if (this._socket?.readyState !== WebSocket.OPEN || this._closing) {
       throw commandError(`Minecraft is not connected. In the game, run ${this.status().connectCommand}`, 'NOT_CONNECTED');
     }
-    if (this._pending?.awaitingLateResponse) {
+    if (this._quarantined()) {
       throw commandError('The previous command result is still unknown. Waiting for its matching response; this command was not sent. Do not retry the previous command automatically.', 'COMMAND_RESULT_PENDING');
     }
     if (!this._ready) {
       throw commandError(`Minecraft session initialization is ${this._initialization}. This command was not sent. Check minecraft_status.`, 'SESSION_NOT_READY');
     }
-    return this._enqueue(commandLine);
   }
 
   _enqueue(commandLine, onResponse, frame) {
+    return this._enqueueJob([commandLine], { onResponse, frame });
+  }
+
+  _enqueueJob(commands, { concurrency = 1, stopOnError = true, batch = false, onResponse, frame } = {}) {
+    if (this._queue.length + commands.length > this.maxQueuedCommands) {
+      return Promise.reject(commandError('The command queue is full. This work was not sent.', 'QUEUE_FULL'));
+    }
     return new Promise((resolve, reject) => {
-      this._queue.push({ command: commandLine, resolve, reject, onResponse, frame });
+      const job = { concurrency, stopOnError, batch, resolve, reject, requested: commands.length,
+        remaining: commands.length, sent: 0, completed: 0, results: [], failures: [] };
+      commands.forEach((command, index) => this._queue.push({ command, index, job, onResponse, frame }));
       this._drain();
+    });
+  }
+
+  _quarantined() {
+    return [...this._pending.values()].some(entry => entry.awaitingLateResponse);
+  }
+
+  _settle(entry, result, error) {
+    if (entry.settled) return;
+    entry.settled = true;
+    const job = entry.job;
+    job.remaining -= 1;
+    if (result) {
+      job.results[entry.index] = job.batch ? { index: entry.index, ...result } : result;
+      job.completed += 1;
+    } else if (error) {
+      job.failures.push({ index: entry.index, command: entry.command,
+        error: error.message, code: error.code, resultUnknown: Boolean(error.resultUnknown) });
+    }
+    if (job.remaining) return;
+    if (this._activeJob === job) this._activeJob = null;
+    if (!job.batch) {
+      if (error) job.reject(error);
+      else job.resolve(result);
+      return;
+    }
+    const failures = job.failures.sort((left, right) => left.index - right.index);
+    const failure = failures.find(item => item.resultUnknown) ?? failures[0];
+    job.resolve({
+      results: job.results.filter(Boolean), requested: job.requested, completed: job.completed,
+      sent: job.sent, skipped: job.requested - job.sent,
+      ...(failure ? { error: failure.error, code: failure.code, interruptedCommand: failure.command,
+        resultUnknown: failures.some(item => item.resultUnknown), failures } : {}),
     });
   }
 
@@ -262,8 +340,8 @@ export class BedrockBridge {
     if (Number.isSafeInteger(packet?.body?.statusCode)) summary.statusCode = packet.body.statusCode;
     summary.statusMessage = shortString(packet?.body?.statusMessage, 300);
     summary.eventName = shortString(packet?.header?.eventName ?? packet?.body?.eventName);
-    const pending = this._pending;
-    if (!pending || packet?.header?.requestId !== pending.requestId) return;
+    const pending = this._pending.get(packet?.header?.requestId);
+    if (!pending) return;
     const purpose = packet.header.messagePurpose;
     const expectedPurpose = pending.frame?.purpose ?? 'commandResponse';
     if (purpose !== expectedPurpose && purpose !== 'error') return;
@@ -292,27 +370,38 @@ export class BedrockBridge {
       return;
     }
     clearTimeout(pending.timer);
-    this._pending = null;
-    if (pending.awaitingLateResponse) this._lastError = null;
-    if (!pending.settled) {
-      pending.settled = true;
-      pending.resolve(result);
+    this._pending.delete(pending.requestId);
+    if (pending.awaitingLateResponse && !this._quarantined()) this._lastError = null;
+    this._settle(pending, result);
+    if (pending.job.stopOnError && (purpose === 'error' || result.statusCode < 0)) {
+      // Ordered batches can stop before sending their next command. Later jobs
+      // remain queued and can still run once this batch has settled.
+      this._discardJob(pending.job);
     }
     this._drain();
   }
 
   _drain() {
-    if (this._pending || !this._queue.length || this._socket?.readyState !== WebSocket.OPEN) return;
+    if (this._quarantined() || !this._queue.length || this._socket?.readyState !== WebSocket.OPEN) return;
+    const job = this._activeJob ?? this._queue[0].job;
+    this._activeJob = job;
+    while (this._queue[0]?.job === job && this._pending.size < job.concurrency
+      && this._socket?.readyState === WebSocket.OPEN && !this._quarantined()) {
+      this._send(this._queue.shift());
+    }
+  }
+
+  _send(pending) {
     const socket = this._socket;
-    const pending = this._queue.shift();
     pending.requestId = randomUUID();
-    this._pending = pending;
+    this._pending.set(pending.requestId, pending);
+    pending.job.sent += 1;
     pending.timer = setTimeout(() => {
-      if (this._pending !== pending) return;
+      if (this._pending.get(pending.requestId) !== pending || pending.awaitingLateResponse) return;
       this._lastError = `Timed out after ${this.commandTimeoutMs} ms waiting for Minecraft.`;
       pending.timedOutAt = new Date().toISOString();
-      // Retain the socket and request ID: a late response may establish the
-      // result. No subsequent command may pass this unresolved request.
+      // A pipeline cannot establish outcomes for other commands still in
+      // flight. Freeze the entire window until all matching replies arrive.
       this._quarantinePending(this._lastError, 'COMMAND_TIMEOUT');
     }, this.commandTimeoutMs);
 
@@ -348,15 +437,20 @@ export class BedrockBridge {
   }
 
   _quarantinePending(reason, code) {
-    const pending = this._pending;
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    pending.awaitingLateResponse = true;
-    if (!pending.settled) {
-      pending.settled = true;
-      pending.reject(commandError(`${reason} The command result is unknown; it may have executed. Do not retry automatically. The connection remains open while waiting for its response.`, code, true));
+    if (!this._pending.size) return;
+    for (const pending of this._pending.values()) {
+      clearTimeout(pending.timer);
+      pending.awaitingLateResponse = true;
+      pending.timedOutAt ??= new Date().toISOString();
+      this._settle(pending, null, commandError(`${reason} The command result is unknown; it may have executed. Do not retry automatically. The connection remains open while waiting for its response.`, code, true));
     }
     this._rejectQueued(reason, code);
+  }
+
+  _discardJob(job) {
+    const skipped = this._queue.filter(entry => entry.job === job);
+    this._queue = this._queue.filter(entry => entry.job !== job);
+    for (const entry of skipped) this._settle(entry);
   }
 
   _disconnect(socket, reason, code = 'CONNECTION_CLOSED') {
@@ -370,21 +464,18 @@ export class BedrockBridge {
   }
 
   _rejectCommands(reason, code) {
-    const pending = this._pending;
-    this._pending = null;
-    if (pending) {
+    for (const pending of this._pending.values()) {
       clearTimeout(pending.timer);
-      if (!pending.settled) {
-        pending.settled = true;
-        pending.reject(commandError(`${reason} The command result is unknown; it may have executed. Do not retry automatically.`, code, true));
-      }
+      this._settle(pending, null, commandError(`${reason} The command result is unknown; it may have executed. Do not retry automatically.`, code, true));
     }
+    this._pending.clear();
     this._rejectQueued(reason, code);
+    this._activeJob = null;
   }
 
   _rejectQueued(reason, code) {
     for (const queued of this._queue.splice(0)) {
-      queued.reject(commandError(`${reason} This queued command was not sent.`, code));
+      this._settle(queued, null, commandError(`${reason} This queued command was not sent.`, code));
     }
   }
 
