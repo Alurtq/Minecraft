@@ -35,10 +35,15 @@ test('MCP stdio handshake, tools and game responses work together', { timeout: 2
   assert.equal(disconnected.isError, true);
 
   const received = [];
+  let respondToGame;
   game = new WebSocket(`ws://127.0.0.1:${initial.port}`);
   game.on('message', data => {
     const frame = JSON.parse(data.toString());
     received.push(frame);
+    if (respondToGame) {
+      respondToGame(frame);
+      return;
+    }
     const error = frame.body.commandLine === 'invalid_command';
     game.send(JSON.stringify({
       header: { version: 1, messagePurpose: 'commandResponse', requestId: frame.header.requestId },
@@ -69,6 +74,44 @@ test('MCP stdio handshake, tools and game responses work together', { timeout: 2
   assert.equal(continued.isError, true);
   assert.equal(payload(continued).completed, 2);
 
+  const beforeUnsafe = received.length;
+  const unsafePipeline = await client.callTool({ name: 'minecraft_batch', arguments: {
+    commands: ['say one', 'say two'], concurrency: 4,
+  } });
+  assert.equal(unsafePipeline.isError, true);
+  assert.equal(received.length, beforeUnsafe, 'concurrency requires explicit stopOnError=false');
+
+  const pipelineRequests = [];
+  respondToGame = frame => {
+    pipelineRequests.push(frame);
+    if (pipelineRequests.length !== 4) return;
+    // Do not acknowledge anything until the entire window has arrived. A
+    // serial implementation cannot pass this real MCP-to-WebSocket check.
+    for (const index of [2, 0, 3, 1]) {
+      const request = pipelineRequests[index];
+      game.send(JSON.stringify({
+        header: { version: 1, messagePurpose: 'commandResponse', requestId: request.header.requestId },
+        body: { statusCode: index === 2 ? -1 : 0, statusMessage: index === 2 ? 'Simulated failure' : 'OK' },
+      }));
+    }
+  };
+  const pipelined = await client.callTool({ name: 'minecraft_batch', arguments: {
+    commands: ['say independent 0', 'say independent 1', 'say independent 2', 'say independent 3'],
+    concurrency: 4, stopOnError: false, responseDetail: 'summary',
+  } });
+  assert.equal(pipelined.isError, true);
+  const pipelineSummary = payload(pipelined);
+  assert.equal(pipelineRequests.length, 4);
+  assert.equal(pipelineSummary.completed, 4);
+  assert.equal(pipelineSummary.sent, 4);
+  assert.equal(pipelineSummary.skipped, 0);
+  assert.equal(pipelineSummary.succeeded, 3);
+  assert.equal(pipelineSummary.failed, 1);
+  assert.equal(pipelineSummary.unknown, 0);
+  assert.equal(pipelineSummary.results, undefined, 'summary omits successful result bodies');
+  assert.equal(pipelineSummary.commandFailures[0].command, 'say independent 2');
+  respondToGame = undefined;
+
   const filled = await client.callTool({ name: 'minecraft_fill', arguments: {
     from: { x: 0, y: 64, z: 0 }, to: { x: 3, y: 67, z: 3 }, block: 'minecraft:glass', mode: 'hollow',
   } });
@@ -80,4 +123,24 @@ test('MCP stdio handshake, tools and game responses work together', { timeout: 2
   assert.equal(oversized.isError, true);
   assert.equal(received.length, beforeLarge);
   assert.match(stderr, /Minecraft Bedrock MCP ready/);
+
+  let beforeDisconnect = 0;
+  respondToGame = () => {
+    beforeDisconnect += 1;
+    if (beforeDisconnect === 4) game.terminate();
+  };
+  const disconnectedBatch = await client.callTool({ name: 'minecraft_batch', arguments: {
+    commands: Array.from({ length: 6 }, (_, index) => `say disconnect ${index}`),
+    concurrency: 4, stopOnError: false, responseDetail: 'summary',
+  } });
+  assert.equal(disconnectedBatch.isError, true);
+  const disconnectedSummary = payload(disconnectedBatch);
+  assert.equal(disconnectedSummary.sent, 4);
+  assert.equal(disconnectedSummary.skipped, 2);
+  assert.equal(disconnectedSummary.completed, 0);
+  assert.equal(disconnectedSummary.unknown, 4);
+  assert.equal(disconnectedSummary.resultUnknown, true);
+  assert.deepEqual(disconnectedSummary.failures.map(failure => failure.index), [0, 1, 2, 3, 4, 5]);
+  assert.equal(disconnectedSummary.failures.filter(failure => failure.resultUnknown).length, 4);
+  assert.deepEqual(disconnectedSummary.commandFailures, []);
 });
